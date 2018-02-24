@@ -1,188 +1,196 @@
-// Sonoff-Tasmota Switch/Outlet Accessory plugin for HomeBridge
-// Jaromir Kopp @MacWyznawca
+// Based off work by Jaromir Kopp @MacWyznawca.
 
-'use strict';
+let Service, Characteristic;
+const mqtt = require('mqtt');
 
-var Service, Characteristic;
-var mqtt = require("mqtt");
-
-module.exports = function(homebridge) {
+module.exports = homebridge => {
   Service = homebridge.hap.Service;
   Characteristic = homebridge.hap.Characteristic;
 
   homebridge.registerAccessory("homebridge-mqtt-switch-tasmota", "mqtt-switch-tasmota", MqttSwitchTasmotaAccessory);
 }
 
-function MqttSwitchTasmotaAccessory(log, config) {
-  this.log = log;
-
-  this.url = config["url"];
-  this.publish_options = {
-    qos: ((config["qos"] !== undefined) ? config["qos"] : 0)
-  };
-
-  this.client_Id = 'mqttjs_' + Math.random().toString(16).substr(2, 8);
-  this.options = {
-    keepalive: 10,
-    clientId: this.client_Id,
-    protocolId: 'MQTT',
-    protocolVersion: 4,
-    clean: true,
-    reconnectPeriod: 1000,
-    connectTimeout: 30 * 1000,
-    will: {
-      topic: 'WillMsg',
-      payload: 'Connection Closed abnormally..!',
+class MqttSwitchTasmotaAccessory {
+  constructor(log, loadedConfig) {
+    const defualtConfig = {
+      url: undefined,
       qos: 0,
-      retain: false
-    },
-    username: config["username"],
-    password: config["password"],
-    rejectUnauthorized: false
-  };
 
-  this.topicStatusGet = config["topics"].statusGet;
-  this.topicStatusSet = config["topics"].statusSet;
-  this.topicsStateGet = (config["topics"].stateGet !== undefined) ? config["topics"].stateGet : "";
+      username: undefined,
+      password: undefined,
 
-  this.onValue = (config["onValue"] !== undefined) ? config["onValue"] : "ON";
-  this.offValue = (config["offValue"] !== undefined) ? config["offValue"] : "OFF";
+      onValue:  "ON",
+      offValue: "OFF",
+      topics:   {},
 
-  let powerVal = this.topicStatusSet.split("/");
-  this.powerValue = powerVal[powerVal.length-1]
-  this.log('Nazwa do RESULT ',this.powerValue);
+      activityTopic: undefined,
+      activityParameter: undefined,
 
-  if (config["activityTopic"] !== undefined && config["activityParameter"] !== undefined) {
-    this.activityTopic = config["activityTopic"];
-    this.activityParameter = config["activityParameter"];
-  } else {
-    this.activityTopic = "";
-    this.activityParameter = "";
-  }
+      startCmd: undefined,
+      startParameter: undefined,
 
-  this.name = config["name"] || "Sonoff";
-  this.manufacturer = config['manufacturer'] || "ITEAD";
-  this.model = config['model'] || "Sonoff";
-  this.serialNumberMAC = config['serialNumberMAC'] || "";
+      name:            'Sonoff',
+      manufacturer:    'ITEAD',
+      model:           'sonoff',
+      serialNumberMAC: '',
+      switchType:      'switch',
+    };
 
-  this.outlet = (config["switchType"] !== undefined) ? ((config["switchType"] == "outlet") ? true : false) : false;
+    // Load configuration
+    const config = Object.assign({}, defualtConfig, loadedConfig);
+    this.config = config;
 
-  this.switchStatus = false;
+    // Setup the homebridge service
+    this.service = config.switchType !== 'outlet'
+      ? new Service.Switch(this.name)
+      : new Service.Outlet(this.name)
+        .getCharacteristic(Characteristic.OutletInUse)
+        .on('get', this.getOutletUse.bind(this));
 
-  if (this.outlet) {
-    this.service = new Service.Outlet(this.name);
     this.service
-      .getCharacteristic(Characteristic.OutletInUse)
-      .on('get', this.getOutletUse.bind(this));
-  } else {
-    this.service = new Service.Switch(this.name);
-  }
+      .getCharacteristic(Characteristic.On)
+      .on('get', this.getStatus.bind(this))
+      .on('set', this.setStatus.bind(this));
 
-  this.service
-    .getCharacteristic(Characteristic.On)
-    .on('get', this.getStatus.bind(this))
-    .on('set', this.setStatus.bind(this));
-
-  if (this.activityTopic !== "") {
-    this.service.addOptionalCharacteristic(Characteristic.StatusActive);
-    this.service
-      .getCharacteristic(Characteristic.StatusActive)
-      .on('get', this.getStatusActive.bind(this));
-  }
-
-
-  this.client = mqtt.connect(this.url, this.options);
-  var that = this;
-  this.client.on('error', function() {
-    that.log('Error event on MQTT');
-  });
-
-  this.client.on('connect', function() {
-    if (config["startCmd"] !== undefined && config["startParameter"] !== undefined) {
-      that.client.publish(config["startCmd"], config["startParameter"]);
+    if (config.activityTopic !== undefined) {
+      this.service.addOptionalCharacteristic(Characteristic.StatusActive);
+      this.service
+        .getCharacteristic(Characteristic.StatusActive)
+        .on('get', this.getStatusActive.bind(this));
     }
-  });
 
-  this.client.on('message', function(topic, message) {
-    if (topic == that.topicStatusGet) {
-      try {
-        // In the event that the user has a DUAL the topicStatusGet will return for POWER1 or POWER2 in the JSON.  
-        // We need to coordinate which accessory is actually being reported and only take that POWER data.  
-        // This assumes that the Sonoff single will return the value { "POWER" : "ON" }
-        var data = JSON.parse(message);
-        var status = data.POWER;
-        if(data.hasOwnProperty(that.powerValue)){
-          var status = data[that.powerValue];
-          that.switchStatus = (status == that.onValue);
-          that.log(that.name, "(",that.powerValue,") - Power from Status", status); //TEST ONLY
-        }
-      } catch (e) {
-        var status = message.toString();
+    this.publishOptions = {qos: config.qos};
+    this.powerVal = config.topics.statusSet.split('/').pop();
 
-        that.switchStatus = (status == that.onValue);
+    // Device state
+    this.switchStatus = false;
+    this.activeStatus = false;
+
+    // Setup MQTT client configuration
+    const randId = Math.random().toString(16).substr(2, 8);
+    const mqttClientId = `homebridgeMqtt_${randId}`;
+
+    const mqttOptions = {
+      keepalive:          10,
+      clientId:           mqttClientId,
+      protocolId:         'MQTT',
+      protocolVersion:    4,
+      reconnectPeriod:    1000,
+      connectTimeout:     30 * 1000,
+      clean:              true,
+      rejectUnauthorized: false,
+
+      username: config.username,
+      password: config.password,
+
+      will: {
+        topic:   'WillMsg',
+        payload: 'Connection Closed abnormally..!',
+        retain:  false,
+        qos:     0,
+      },
+    };
+
+    const handlers = {
+      [config.topics.statusGet]: this.receiveStatus.bind(this),
+      [config.topics.StateGet]:  this.receiveState.bind(this),
+      [config.activityTopic]:    this.receiveActivity.bind(this),
+    };
+
+    // Listen for the device over mqtt
+    this.client = mqtt.connect(config.url, mqttOptions);
+
+    this.client.on('error', _ => log('Error event over mqtt'));
+
+    this.client.on('connect', _ => {
+      if (config.startCmd !== undefined && config.startParameter !== undefined) {
+        this.client.publish(config.startCmd, config.startParameter);
       }
-      that.service.getCharacteristic(Characteristic.On).setValue(that.switchStatus, undefined, 'fromSetValue');
-    }
+    });
 
-    if (topic == that.topicsStateGet) {
+    this.client.on('message', (topic, message) => {
+      if (handlers[topic] === undefined) {
+        return;
+      }
+
       try {
-        var data = JSON.parse(message);
-        if (data.hasOwnProperty(that.powerValue)) {
-          var status = data[that.powerValue];
-          that.log(that.name, "(",that.powerValue,") - Power from State", status); //TEST ONLY
-          that.switchStatus = (status == that.onValue);
-          that.service.getCharacteristic(Characteristic.On).setValue(that.switchStatus, undefined, '');
-        }
-      } catch (e) {}
-    } else if (topic == that.activityTopic) {
-      var status = message.toString();
-      that.activeStat = (status == that.activityParameter);
-      that.service.setCharacteristic(Characteristic.StatusActive, that.activeStat);
+        handlers[topic](message);
+      } catch (e) {
+        log(config.name, `Failed to handle topic: ${message.toString()}`, e);
+      }
+    });
+
+    // Register for enabled topics
+    Object.keys(handlers).map(t => t && this.client.subscribe(t));
+  }
+
+  markSwitchStatus(message) {
+    const data = JSON.parse(message);
+
+    if (!data.hasOwnProperty(this.powerValue)) {
+      return;
     }
-  });
-  this.client.subscribe(this.topicStatusGet);
-  if (this.topicsStateGet !== "") {
-    this.client.subscribe(this.topicsStateGet);
+
+    const state = data[this.powerValue];
+    this.switchStatus = state == this.config.onValue;
   }
-  if (this.activityTopic !== "") {
-    this.client.subscribe(this.activityTopic);
+
+  receiveStatus(message) {
+    // XXX: In the event that the user has a DUAL the topicStatusGet will
+    // return for POWER1 or POWER2 in the JSON.  We need to coordinate which
+    // accessory is actually being reported and only take that POWER data.
+    // This assumes that the Sonoff single will return {"POWER": "ON"}
+    this.markSwitchStatus(message)
+    this.service
+      .getCharacteristic(Characteristic.On)
+      .setValue(this.switchStatus, undefined, 'fromSetValue');
   }
-}
 
-MqttSwitchTasmotaAccessory.prototype.getStatus = function(callback) {
-  if (this.activeStat) {
-    callback(null, this.switchStatus);
-  } else {
-    callback(null);   
+  receiveState(message) {
+    this.markSwitchStatus(message)
+    this.service
+      .getCharacteristic(Characteristic.On)
+      .setValue(this.switchStatus, undefined, null);
   }
-}
 
-MqttSwitchTasmotaAccessory.prototype.setStatus = function(status, callback, context) {
-  if (context !== 'fromSetValue') {
-    this.switchStatus = status;
-    this.client.publish(this.topicStatusSet, status ? this.onValue : this.offValue, this.publish_options);
+  receiveActivity() {
+    const state = message.toString();
+    this.activeStatus = state == this.config.activityParameter;
+    this.service.setCharacteristic(Characteristic.StatusActive, this.activeStatus);
   }
-  callback();
-}
 
-MqttSwitchTasmotaAccessory.prototype.getStatusActive = function(callback) {
-  this.log(this.name, " -  Activity Set : ", this.activeStat);
-  callback(null, this.activeStat);
-}
+  setStatus(state, next, context) {
+    if (context == 'fromSetValue') {
+      return next();
+    }
 
-MqttSwitchTasmotaAccessory.prototype.getOutletUse = function(callback) {
-  callback(null, true); // If configured for outlet - always in use (for now)
-}
+    const topic = this.config.topics.statusSet;
+    const mqttBoolean = state ? this.config.onValue : this.config.offValue;
+    this.switchStatus = state;
+    this.client.publish(topic, mqttBoolean, this.publishOptions);
+    next();
+  }
 
-MqttSwitchTasmotaAccessory.prototype.getServices = function() {
+  getStatus(next) {
+    next(null, this.switchStatus);
+  }
 
-  var informationService = new Service.AccessoryInformation();
+  getStatusActive(next) {
+    next(null, this.activeStatus);
+  }
 
-  informationService
-    .setCharacteristic(Characteristic.Name, this.name)
-    .setCharacteristic(Characteristic.Manufacturer, this.manufacturer)
-    .setCharacteristic(Characteristic.Model, this.model)
-    .setCharacteristic(Characteristic.SerialNumber, this.serialNumberMAC);
+  getOutletUse(next) {
+    // XXX: For now outlets are always marked as "in use"
+    next(null, true);
+  }
 
-  return [informationService, this.service];
+  getServices() {
+    const serviceInfo = new Service.AccessoryInformation()
+      .setCharacteristic(Characteristic.Name, this.config.name)
+      .setCharacteristic(Characteristic.Model, this.config.model)
+      .setCharacteristic(Characteristic.Manufacturer, this.config.manufacturer)
+      .setCharacteristic(Characteristic.SerialNumber, this.config.serialNumberMAC);
+
+    return [serviceInfo, this.service];
+  }
 }
