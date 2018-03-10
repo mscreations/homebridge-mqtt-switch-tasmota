@@ -153,7 +153,7 @@ class MqttSwitchTasmotaAccessory {
       .setValue(this.switchStatus, undefined, null);
   }
 
-  receiveActivity() {
+  receiveActivity(message) {
     const state = message.toString();
     this.activeStatus = state == this.config.activityParameter;
     this.service.setCharacteristic(Characteristic.StatusActive, this.activeStatus);
