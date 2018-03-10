@@ -126,12 +126,11 @@ class MqttSwitchTasmotaAccessory {
 
   markSwitchStatus(message) {
     const data = JSON.parse(message);
-
-    if (!data.hasOwnProperty(this.powerValue)) {
+    if (!data.hasOwnProperty(this.powerVal)) {
       return;
     }
 
-    const state = data[this.powerValue];
+    const state = data[this.powerVal];
     this.switchStatus = state == this.config.onValue;
   }
 
