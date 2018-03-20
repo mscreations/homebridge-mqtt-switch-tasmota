@@ -93,7 +93,7 @@ class MqttSwitchTasmotaAccessory {
 
     const handlers = {
       [config.topics.statusGet]: this.receiveStatus.bind(this),
-      [config.topics.StateGet]:  this.receiveState.bind(this),
+      [config.topics.stateGet]:  this.receiveState.bind(this),
       [config.activityTopic]:    this.receiveActivity.bind(this),
     };
 
